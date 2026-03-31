@@ -1,0 +1,174 @@
+.GITHUB/WORKFLOWS/CI.YML
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Run flake8
+        run: |
+          flake8 fotnssj.py \
+                 geometry/ \
+                 branches/ \
+                 dispatch/ \
+                 sync/ \
+                 cloud/receiver.py \
+            --max-line-length=120 \
+            --extend-ignore=E501,W503,E302,E303 \
+            --exclude=__pycache__,*.pyc
+
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install flask cryptography pytest pytest-cov
+
+      - name: Run geometry tests
+        run: pytest tests/test_geometry.py -v
+
+      - name: Run branch tests
+        run: pytest tests/test_branches.py -v
+
+      - name: Run dispatch tests
+        run: pytest tests/test_dispatch.py -v
+
+      - name: Run sync tests
+        run: pytest tests/test_sync.py -v
+
+      - name: Run session manager tests
+        run: pytest tests/test_session_manager.py -v
+
+      - name: Run route tests
+        run: pytest tests/test_routes.py -v
+
+      - name: Coverage report
+        run: |
+          pytest tests/ \
+            --cov=fotnssj \
+            --cov=geometry \
+            --cov=branches \
+            --cov=dispatch \
+            --cov=sync \
+            --cov-report=term-missing \
+            --cov-fail-under=60
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build school image
+        run: docker build -t fotnssj:ci .
+
+      - name: Smoke test health endpoint
+        run: |
+          docker run -d \
+            --name fotnssj-ci \
+            -p 5000:5000 \
+            -e SECRET_KEY=ci-test-key-not-for-production-64chars-padding \
+            -e ADMIN_USER=admin \
+            -e ADMIN_PASS=testpass \
+            -e LLM_BASE_URL=http://localhost:11434 \
+            fotnssj:ci
+          echo "Waiting for container..."
+          sleep 8
+          curl -f http://localhost:5000/health || \
+            (docker logs fotnssj-ci && exit 1)
+          docker stop fotnssj-ci
+
+      - name: Build receiver image
+        run: |
+          docker build \
+            -f cloud/Dockerfile.receiver \
+            -t fotnssj-receiver:ci .
+
+      - name: Smoke test receiver
+        run: |
+          docker run -d \
+            --name fotnssj-receiver-ci \
+            -p 8080:8080 \
+            fotnssj-receiver:ci
+          sleep 5
+          curl -f http://localhost:8080/health || \
+            (docker logs fotnssj-receiver-ci && exit 1)
+          docker stop fotnssj-receiver-ci
+
+  test-compose:
+    name: Compose Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create test .env
+        run: |
+          cat > .env << 'EOF'
+          SECRET_KEY=ci-integration-test-secret-key-64-chars-padded-here
+          ADMIN_USER=admin
+          ADMIN_PASS=testpass123
+          LLM_BASE_URL=http://host.docker.internal:11434
+          LLM_MODEL=qwen3:1.5b
+          CLOUD_SYNC_ENDPOINT=
+          ALERT_WEBHOOK_URL=
+          EOF
+
+      - name: Start student container only
+        run: |
+          docker-compose up --build -d student
+          echo "Waiting for student to be healthy..."
+          ATTEMPTS=0
+          until curl -sf http://localhost:5000/health; do
+            ATTEMPTS=$((ATTEMPTS+1))
+            [ $ATTEMPTS -gt 30 ] && \
+              (docker-compose logs student && exit 1)
+            sleep 2
+          done
+
+      - name: Verify health response shape
+        run: |
+          RESP=$(curl -sf http://localhost:5000/health)
+          echo "$RESP" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert d['status'] == 'ok', f'status not ok: {d}'
+          assert 'dispatcher' in d, 'missing dispatcher key'
+          assert 'geometry' in d,   'missing geometry key'
+          print('Health response valid')
+          "
+
+      - name: Verify student dashboard renders
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://localhost:5000/student/ci_test_student)
+          [ "$STATUS" = "200" ] || (echo "Got $STATUS" && exit 1)
+
+      - name: Stop containers
+        if: always()
+        run: docker-compose down -v

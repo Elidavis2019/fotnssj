@@ -1,0 +1,113 @@
+docker-compose.yml
+
+# ════════════════════════════════════════════════════════════════════════
+# FOTNSSJ — Four containers, shared volumes
+#
+# Start:  docker-compose up --build -d
+# Logs:   docker-compose logs -f student
+# Stop:   docker-compose down
+# Reset:  docker-compose down -v   (WARNING: wipes all student data)
+# ════════════════════════════════════════════════════════════════════════
+version: "3.9"
+
+x-common-security: &security
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+x-common-healthcheck: &healthcheck
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+    interval: 30s
+    timeout: 10s
+    start_period: 20s
+    retries: 3
+
+volumes:
+  checkpoint_data:   # crystallized knowledge — student writes, teacher edits
+  session_data:      # raw answer log — student writes, admin reads
+  auth_data:         # teacher + admin accounts
+  state_data:        # persistent session state — student writes only
+  geometry_data:     # malformation reports — manifest writes, admin reads
+
+services:
+
+  student:
+    build: .
+    container_name: fotnssj-student
+    restart: unless-stopped
+    <<: [*security, *healthcheck]
+    volumes:
+      - checkpoint_data:/data/checkpoints
+      - session_data:/data/sessions
+      - state_data:/data/state
+      - geometry_data:/data/geometry
+    ports:
+      - "5000:5000"
+    environment:
+      - MODE=student
+      - SECRET_KEY=${SECRET_KEY:-changeme_generate_a_real_one}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:11434}
+      - LLM_MODEL=${LLM_MODEL:-qwen3:1.5b}
+      - OLLAMA_CTX=${OLLAMA_CTX:-2048}
+      - CLOUD_SYNC_ENDPOINT=${CLOUD_SYNC_ENDPOINT:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  viewer:
+    build: .
+    container_name: fotnssj-viewer
+    restart: unless-stopped
+    <<: [*security, *healthcheck]
+    volumes:
+      - checkpoint_data:/data/checkpoints:ro
+      - state_data:/data/state:ro
+    ports:
+      - "5001:5000"
+    environment:
+      - MODE=viewer
+      - SECRET_KEY=${SECRET_KEY:-changeme_viewer}
+    depends_on:
+      student:
+        condition: service_healthy
+
+  teacher:
+    build: .
+    container_name: fotnssj-teacher
+    restart: unless-stopped
+    <<: [*security, *healthcheck]
+    volumes:
+      - checkpoint_data:/data/checkpoints
+      - auth_data:/data/auth
+    ports:
+      - "5002:5000"
+    environment:
+      - MODE=teacher
+      - SECRET_KEY=${SECRET_KEY:-changeme_teacher}
+    depends_on:
+      student:
+        condition: service_healthy
+
+  admin:
+    build: .
+    container_name: fotnssj-admin
+    restart: unless-stopped
+    <<: [*security, *healthcheck]
+    volumes:
+      - checkpoint_data:/data/checkpoints:ro
+      - session_data:/data/sessions:ro
+      - state_data:/data/state:ro
+      - auth_data:/data/auth
+      - geometry_data:/data/geometry
+    ports:
+      - "5003:5000"
+    environment:
+      - MODE=admin
+      - SECRET_KEY=${SECRET_KEY:-changeme_admin}
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_PASS=${ADMIN_PASS:-changeme_set_this}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+    depends_on:
+      student:
+        condition: service_healthy

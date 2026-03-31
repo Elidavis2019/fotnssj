@@ -1,0 +1,26 @@
+cloud/Dockerfile.receiver
+
+FROM python:3.11-slim
+
+RUN groupadd -r receiver && useradd -r -g receiver -d /app -s /sbin/nologin receiver
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir flask>=3.0.0 gunicorn>=21.0.0
+
+COPY cloud/receiver.py .
+
+RUN mkdir -p /data/receiver && chown -R receiver:receiver /data /app
+
+USER receiver
+
+HEALTHCHECK \
+    --interval=30s \
+    --timeout=5s \
+    --start-period=10s \
+    --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
+
+EXPOSE 8080
+
+CMD ["python", "receiver.py"]
