@@ -1,0 +1,115 @@
+docker-compose.prod.yml
+
+# ════════════════════════════════════════════════════════════════════════
+# FOTNSSJ Production Compose
+# Adds nginx TLS termination, Prometheus, and automatic backups.
+#
+# Usage:
+#   docker-compose -f docker-compose.yml \
+#                  -f docker-compose.prod.yml up -d
+# ════════════════════════════════════════════════════════════════════════
+version: "3.9"
+
+x-logging: &logging
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+volumes:
+  nginx_certs:
+  nginx_www:
+  backup_data:
+  prometheus_data:
+
+services:
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: fotnssj-nginx
+    restart: unless-stopped
+    <<: *logging
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_certs:/etc/letsencrypt:ro
+      - nginx_www:/var/www/certbot
+    environment:
+      - STUDENT_DOMAIN=${STUDENT_DOMAIN:-student.example.com}
+      - ADMIN_DOMAIN=${ADMIN_DOMAIN:-admin.example.com}
+      - VIEWER_DOMAIN=${VIEWER_DOMAIN:-view.example.com}
+    depends_on:
+      student:
+        condition: service_healthy
+      admin:
+        condition: service_healthy
+      teacher:
+        condition: service_healthy
+      viewer:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: fotnssj-certbot
+    volumes:
+      - nginx_certs:/etc/letsencrypt
+      - nginx_www:/var/www/certbot
+    entrypoint: >
+      /bin/sh -c "trap exit TERM;
+      while :; do
+        certbot renew --webroot -w /var/www/certbot --quiet;
+        sleep 12h & wait $${!};
+      done"
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: fotnssj-prometheus
+    restart: unless-stopped
+    <<: *logging
+    volumes:
+      - ./nginx/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    security_opt:
+      - no-new-privileges:true
+
+  backup-cron:
+    build: .
+    container_name: fotnssj-backup
+    restart: unless-stopped
+    <<: *logging
+    volumes:
+      - checkpoint_data:/data/checkpoints:ro
+      - session_data:/data/sessions:ro
+      - state_data:/data/state:ro
+      - auth_data:/data/auth:ro
+      - geometry_data:/data/geometry:ro
+      - backup_data:/data/backups
+    environment:
+      - SECRET_KEY=${SECRET_KEY}
+    entrypoint: >
+      /bin/sh -c "
+      while true; do
+        python backup.py backup auto;
+        python backup.py prune 14;
+        sleep 86400;
+      done"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
