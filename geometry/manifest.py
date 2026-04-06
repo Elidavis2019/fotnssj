@@ -1,5 +1,3 @@
-geometry/manifest.py
-
 import math
 import time
 import json

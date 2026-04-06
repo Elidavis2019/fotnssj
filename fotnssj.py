@@ -16,11 +16,12 @@ import time
 import json
 import uuid
 import math
+import queue
 import hashlib
 import hmac
 import secrets
 import threading
-import queue
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -36,6 +37,59 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
     print("[!] 'openai' package not found. Falling back to hardcoded questions.")
+
+from dispatch import OllamaDispatcher, Priority
+from geometry.manifest import GeometryManifest
+
+
+def _parse_questions(raw: str) -> Optional[List[Dict]]:
+    """Parse a JSON array of question dicts from raw LLM output."""
+    start, end = raw.find("["), raw.rfind("]")
+    if start == -1 or end == -1:
+        return None
+    try:
+        data = json.loads(raw[start:end + 1])
+        valid = [
+            i for i in data
+            if isinstance(i, dict)
+            and {"question", "correct_answer", "explanation", "bridge"}.issubset(i.keys())
+        ]
+        return valid if valid else None
+    except json.JSONDecodeError:
+        return None
+
+def _answers_match(student_answer: str, correct_answer: str) -> bool:
+    """
+    Language-aware answer comparison.
+    Handles accents, full-width characters, Arabic diacritics,
+    extra whitespace, and case differences.
+    """
+    def normalise(text: str) -> str:
+        # Lowercase
+        text = text.lower().strip()
+        # Unicode NFC normalisation — combines accent characters
+        text = unicodedata.normalize("NFC", text)
+        # Remove Arabic diacritics (tashkeel) — students often omit them
+        text = re.sub(r"[\u0610-\u061A\u064B-\u065F]", "", text)
+        # Collapse internal whitespace
+        text = re.sub(r"\s+", " ", text)
+        # Convert full-width digits/letters to ASCII (Japanese/Chinese input)
+        text = text.translate(str.maketrans(
+            "０１２３４５６７８９ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ",
+            "0123456789abcdefghijklmnopqrstuvwxyz"
+        ))
+        # Convert written numbers to digits for math questions
+        number_words = {
+            "zero":"0","one":"1","two":"2","three":"3","four":"4",
+            "five":"5","six":"6","seven":"7","eight":"8","nine":"9","ten":"10",
+            "cuatro":"4","quatre":"4","vier":"4","quattro":"4",
+            "cinco":"5","cinq":"5","fünf":"5",
+        }
+        for word, digit in number_words.items():
+            text = re.sub(r"\b" + word + r"\b", digit, text)
+        return text
+
+    return normalise(student_answer) == normalise(correct_answer)
 
 # ════════════════════════════════════════════════════════════════════════
 # §1 CORE GEOMETRY & CHECKPOINT DATA STRUCTURES
@@ -151,6 +205,12 @@ class StreakTracker:
 
     def current_streak(self, topic: str) -> int:
         return self._streaks.get(topic, 0)
+
+    def to_dict(self) -> Dict:
+        return dict(self._streaks)
+
+    def load_dict(self, d: Dict):
+        self._streaks = dict(d)
 
 # ════════════════════════════════════════════════════════════════════════
 # §2 RAW SESSION STORE (ADMIN APPEND-ONLY LOG)
@@ -271,10 +331,48 @@ class GeneratedQuestion:
     source: str = "llm" 
     generated_at: float = field(default_factory=time.time)
 
-QUESTION_PROMPTS: Dict[str, str] = {
-    "arithmetic": "Generate exactly {batch_size} math questions for {topic}. Principle: {principle}. Difficulty: {difficulty}/3. Respond ONLY with a JSON array containing keys: question, correct_answer, explanation, bridge, difficulty.",
-    "reading": "Generate exactly {batch_size} reading/phonics questions for {topic}. Principle: {principle}. Difficulty: {difficulty}/3. Respond ONLY with a JSON array containing keys: question, correct_answer, explanation, bridge, difficulty.",
-    "default": "Generate exactly {batch_size} educational questions for {topic}. Principle: {principle}. Difficulty: {difficulty}/3. Respond ONLY with a JSON array containing keys: question, correct_answer, explanation, bridge, difficulty."
+LANGUAGE_NAMES = {
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "zh": "Mandarin Chinese",
+    "ar": "Arabic",
+    "hi": "Hindi",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "sw": "Swahili",
+    "tl": "Filipino (Tagalog)",
+    "vi": "Vietnamese",
+    "ko": "Korean",
+    "so": "Somali",
+    "am": "Amharic",
+}
+
+PROMPTS = {
+    "arithmetic": (
+        "Generate exactly {n} math questions for topic: {topic}. "
+        "Principle: {principle}. Difficulty: {d}/3. "
+        "Write ALL questions, answers, explanations, and bridges "
+        "in {language}. "
+        "Respond ONLY with a JSON array. Keys per item: "
+        "question, correct_answer, explanation, bridge, difficulty."
+    ),
+    "reading": (
+        "Generate exactly {n} reading/phonics questions for topic: {topic}. "
+        "Principle: {principle}. Difficulty: {d}/3. "
+        "Write ALL questions, answers, explanations, and bridges "
+        "in {language}. "
+        "Respond ONLY with a JSON array. Keys per item: "
+        "question, correct_answer, explanation, bridge, difficulty."
+    ),
+    "default": (
+        "Generate exactly {n} educational questions for topic: {topic}. "
+        "Principle: {principle}. Difficulty: {d}/3. "
+        "Write ALL questions, answers, explanations, and bridges "
+        "in {language}. "
+        "Respond ONLY with a JSON array. Keys per item: "
+        "question, correct_answer, explanation, bridge, difficulty."
+    ),
 }
 
 class LLMClient:
@@ -290,10 +388,11 @@ class LLMClient:
         self._client  = OpenAI(base_url=self.base_url, api_key=self.api_key) if OPENAI_AVAILABLE else None
         self._available = OPENAI_AVAILABLE
 
-    def generate_questions(self, topic: str, domain: str, principle: str, difficulty: int = 1) -> Optional[List[Dict]]:
+    def generate_questions(self, topic: str, domain: str, principle: str, difficulty: int = 1, language: str = "English") -> Optional[List[Dict]]:
         if not self._available: return None
-        prompt = QUESTION_PROMPTS.get(domain, QUESTION_PROMPTS["default"]).format(
-            topic=topic.replace("_", " "), principle=principle, difficulty=difficulty, batch_size=self.BATCH_SIZE
+        prompt = PROMPTS.get(domain, PROMPTS["default"]).format(
+            topic=topic.replace("_", " "), principle=principle,
+            d=difficulty, n=self.BATCH_SIZE, language=language
         )
         for attempt in range(self.MAX_RETRIES):
             try:
@@ -320,64 +419,109 @@ class LLMClient:
             return None
 
 class QuestionCache:
-    REFILL_THRESHOLD = 2    
-    MAX_QUEUE_SIZE   = 50   
+    REFILL_THRESHOLD = 2
+    MAX_QUEUE_SIZE   = 50
+    BATCH            = 8
 
-    def __init__(self, llm_client: LLMClient, domain_model: "DomainKnowledgeModel"):
+    def __init__(self, llm_client: LLMClient, domain_model: "DomainKnowledgeModel",
+                 dispatcher: Optional[OllamaDispatcher] = None):
         self._client = llm_client
         self._domain = domain_model
+        self._dispatcher = dispatcher
         self._queues = {}
         self._filling = {}
         self._lock = threading.Lock()
         self._used = {}
 
-    def _get_queue(self, topic: str) -> queue.Queue:
+    def _get_queue(self, cache_key: str) -> queue.Queue:
         with self._lock:
-            if topic not in self._queues:
-                self._queues[topic]  = queue.Queue(maxsize=self.MAX_QUEUE_SIZE)
-                self._filling[topic] = False
-                self._used[topic]    = []
-        return self._queues[topic]
+            if cache_key not in self._queues:
+                self._queues[cache_key]  = queue.Queue(maxsize=self.MAX_QUEUE_SIZE)
+                self._filling[cache_key] = False
+                self._used[cache_key]    = []
+        return self._queues[cache_key]
 
-    def get_question(self, topic: str, domain: str) -> GeneratedQuestion:
-        q = self._get_queue(topic)
+    def get_question(self, topic: str, domain: str,
+                     lang: str = "en") -> GeneratedQuestion:
+        q = self._get_queue(f"{topic}:{lang}")        # key includes language
         if q.qsize() <= self.REFILL_THRESHOLD:
-            self._trigger_refill(topic, domain)
+            self._trigger(topic, domain, Priority.NORMAL, lang)
         try:
-            question = q.get_nowait()
+            gq = q.get_nowait()
             with self._lock:
-                self._used[topic].append(question)
-            return question
+                used_key = f"{topic}:{lang}"
+                self._used.setdefault(used_key, []).append(gq)
+            return gq
         except queue.Empty:
-            return self._fallback(topic, domain)
+            return self._fallback(topic, domain, lang)
 
-    def _trigger_refill(self, topic: str, domain: str):
+    def _trigger(self, topic: str, domain: str,
+                 priority: int = Priority.NORMAL,
+                 lang: str = "en"):
+        cache_key = f"{topic}:{lang}"
         with self._lock:
-            if self._filling.get(topic, False): return
-            self._filling[topic] = True
-        threading.Thread(target=self._fill_cache, args=(topic, domain), daemon=True).start()
+            if self._filling.get(cache_key):
+                return
+            self._filling[cache_key] = True
 
-    def _fill_cache(self, topic: str, domain: str):
-        try:
-            principle = self._domain._domains.get(domain, {}).get("topics", {}).get(topic, {}).get("principle", "")
-            raw_questions = self._client.generate_questions(topic=topic, domain=domain, principle=principle, difficulty=1)
-            if raw_questions:
-                q = self._get_queue(topic)
-                for raw in raw_questions:
-                    if q.full(): break
-                    gq = GeneratedQuestion(
-                        topic=topic, domain=domain, question=raw["question"], 
-                        correct_answer=str(raw["correct_answer"]).strip(), explanation=raw["explanation"], 
-                        bridge=raw["bridge"], source="llm"
-                    )
-                    try: q.put_nowait(gq)
-                    except queue.Full: break
-        finally:
-            with self._lock:
-                self._filling[topic] = False
+        principle    = (self._domain._domains.get(domain, {})
+                        .get("topics", {}).get(topic, {})
+                        .get("principle", ""))
+        language_name = LANGUAGE_NAMES.get(lang, "English")
 
-    def _fallback(self, topic: str, domain: str) -> GeneratedQuestion:
-        used_count = len(self._used.get(topic, []))
+        prompt = PROMPTS.get(domain, PROMPTS["default"]).format(
+            n=self.BATCH, topic=topic.replace("_", " "),
+            principle=principle, d=1,
+            language=language_name,
+        )
+
+        def on_result(raw: Optional[str]):
+            try:
+                if not raw:
+                    raise ValueError("empty")
+                items = _parse_questions(raw)
+                if items:
+                    q = self._get_queue(cache_key)
+                    for item in items:
+                        if q.full():
+                            break
+                        try:
+                            q.put_nowait(GeneratedQuestion(
+                                topic=topic, domain=domain,
+                                question=item["question"],
+                                correct_answer=str(item["correct_answer"]).strip(),
+                                explanation=item["explanation"],
+                                bridge=item["bridge"],
+                                source="ollama",
+                            ))
+                        except queue.Full:
+                            break
+            except Exception as e:
+                print(f"[CACHE] Fill error ({topic}/{lang}): {e}")
+            finally:
+                with self._lock:
+                    self._filling[cache_key] = False
+
+        if self._dispatcher:
+            self._dispatcher.submit(
+                student_id=f"__cache_{topic}_{lang}",
+                prompt=prompt, callback=on_result,
+                priority=priority, timeout=20.0,
+            )
+        else:
+            # Fallback: use LLMClient in a background thread
+            def _thread_fill():
+                language_name_ = LANGUAGE_NAMES.get(lang, "English")
+                raw_questions = self._client.generate_questions(
+                    topic=topic, domain=domain, principle=principle,
+                    difficulty=1, language=language_name_,
+                )
+                raw_str = json.dumps(raw_questions) if raw_questions else None
+                on_result(raw_str)
+            threading.Thread(target=_thread_fill, daemon=True).start()
+
+    def _fallback(self, topic: str, domain: str, lang: str = "en") -> GeneratedQuestion:
+        used_count = len(self._used.get(f"{topic}:{lang}", []))
         q_text, correct, explanation = ("What is 2 + 2?", "4", "2 + 2 = 4.")
         if topic == "addition_basic" and used_count % 2 == 1:
             q_text, correct, explanation = ("What is 3 + 3?", "6", "3 + 3 = 6.")
@@ -385,7 +529,74 @@ class QuestionCache:
 
     def warm_cache(self, topics: List[Tuple[str, str]]):
         for topic, domain in topics:
-            self._trigger_refill(topic, domain)
+            self._trigger(topic, domain, Priority.NORMAL, "en")
+
+class ContextualRequester:
+    def __init__(self, cache: QuestionCache, domain_model: "DomainKnowledgeModel",
+                 branches=None, dispatcher=None):
+        self._cache = cache
+        self._domain = domain_model
+        self._branches = branches
+        self._dispatcher = dispatcher
+        self._next = {}
+        self._lock = threading.Lock()
+
+    def get_next(self, student_id: str, topic: str,
+                 domain: str, lang: str = "en") -> GeneratedQuestion:
+        with self._lock:
+            pre = self._next.pop(student_id, None)
+        self._schedule(student_id, topic, domain, lang)
+        return pre or self._cache.get_question(topic, domain, lang)
+
+    def _schedule(self, student_id: str, topic: str,
+                  domain: str, lang: str = "en"):
+        if not self._branches or not self._dispatcher:
+            return
+        agent = self._branches.get_agent(student_id) if hasattr(self._branches, 'get_agent') else self._branches.get(student_id)
+        if not agent:
+            return
+        language_name = LANGUAGE_NAMES.get(lang, "English")
+        principle = (self._domain._domains.get(domain, {})
+                     .get("topics", {}).get(topic, {})
+                     .get("principle", ""))
+        prompt = (
+            f"You are tutoring a student. Learning history:\n\n"
+            f"{agent.get_context()}\n\n"
+            f"Generate ONE question for topic '{topic.replace('_', ' ')}' "
+            f"(principle: {principle}). "
+            f"Write the question, answer, explanation, and bridge "
+            f"entirely in {language_name}. "
+            f"Match difficulty to their recent trajectory. "
+            f"Respond ONLY with JSON: "
+            f'{{\"question\": ..., \"correct_answer\": ..., '
+            f'\"explanation\": ..., \"bridge\": ...}}'
+        )
+
+        def on_result(raw: Optional[str]):
+            try:
+                if not raw:
+                    return
+                data = json.loads(raw.strip())
+                if isinstance(data, list):
+                    data = data[0]
+                gq = GeneratedQuestion(
+                    topic=topic, domain=domain,
+                    question=data["question"],
+                    correct_answer=str(data["correct_answer"]).strip(),
+                    explanation=data["explanation"],
+                    bridge=data.get("bridge", ""),
+                    source="contextual",
+                )
+                with self._lock:
+                    self._next[student_id] = gq
+            except Exception as e:
+                print(f"[CTX] Schedule error ({student_id}/{topic}/{lang}): {e}")
+
+        self._dispatcher.submit(
+            student_id=student_id,
+            prompt=prompt, callback=on_result,
+            priority=Priority.HIGH, timeout=15.0,
+        )
 
 # ════════════════════════════════════════════════════════════════════════
 # §4 DOMAIN KNOWLEDGE MODEL & SESSION MANAGEMENT
@@ -491,6 +702,7 @@ class SessionManager:
                 "crystallizations":     [c.to_dict() for c in data["crystallizations"].values()],
                 "current_question_dict": data.get("current_question_dict"),
                 "saved_at":             time.time(),
+                "language":             data.get("language", "en"),
             }, indent=2))
         except Exception as e:
             print(f"[STATE] Persist failed {student_id}: {e}")
@@ -504,6 +716,7 @@ class SessionManager:
             "position":             GeometricPosition.default(),
             "current_question":     None,
             "current_question_dict": None,
+            "language":             "en",
         }
         path = self.STATE_ROOT / f"{student_id}.json"
         if not path.exists():
@@ -535,6 +748,7 @@ class SessionManager:
                     raw.get("position", GeometricPosition.default().to_dict())),
                 "current_question":     current_question,
                 "current_question_dict": cqd,
+                "language":             raw.get("language", "en"),
             }
         except Exception as e:
             print(f"[STATE] Load failed {student_id}: {e}")
@@ -604,31 +818,6 @@ class MicroRAGManager:
             "raw_checkpoint": best_checkpoint
         }
 
-    def get_or_create(self, student_id: str) -> Dict:
-        with self.lock:
-            if student_id not in self._students:
-                self._students[student_id] = {
-                    "streak_tracker": StreakTracker(),
-                    "crystallizations": {}, 
-                    "current_domain": "arithmetic",
-                    "current_topic": "addition_basic",
-                    "position": GeometricPosition.default(),
-                    "current_question": None
-                }
-            return self._students[student_id]
-
-    def save_crystal(self, student_id: str, crystal: Crystallization):
-        with self.lock:
-            self.get_or_create(student_id)["crystallizations"][crystal.id] = crystal
-
-    def get_crystals(self, student_id: str) -> List[Crystallization]:
-        with self.lock:
-            student = self.get_or_create(student_id)
-            return sorted(list(student["crystallizations"].values()), key=lambda x: x.saved_at, reverse=True)
-          
-    def all_student_ids(self) -> List[str]:
-        return list(self._students.keys())
-
 # ════════════════════════════════════════════════════════════════════════
 # §5 NFC PHYSICAL STATION REGISTRY
 # ════════════════════════════════════════════════════════════════════════
@@ -678,6 +867,9 @@ class StationRegistry:
 
     def all_stations(self) -> List[Station]:
         return sorted([s for s in self._stations.values() if s.active], key=lambda s: s.label)
+
+    def all_active(self) -> List[Station]:
+        return self.all_stations()
 
     def increment_scan(self, station_id: str):
         with self._lock:
@@ -769,11 +961,39 @@ class AdminAuth:
 STUDENT_TEMPLATE = """
 <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>body{font-family:system-ui; background:#f4f4f5; margin:0; padding:2rem;} .card{background:white; padding:2rem; border-radius:8px; box-shadow:0 4px 6px -1px rgb(0 0 0 / 0.1); margin-bottom:2rem;} .btn{background:#3b82f6; color:white; padding:0.5rem 1rem; border:none; border-radius:4px; cursor:pointer;} input{width:100%; padding:0.75rem; border:1px solid #d4d4d8; margin-bottom:1rem;}</style></head>
 <body>
+
+<!-- Language selector — top of page -->
+<div style="text-align:right;padding:.5rem 2rem;background:#e0e7ff;">
+  <form action="/set_language" method="POST" style="display:inline;">
+    <select name="lang" onchange="this.form.submit()"
+            style="padding:.3rem;border-radius:4px;border:1px solid #c7d2fe;">
+      <option value="en"  {% if lang == 'en'  %}selected{% endif %}>English</option>
+      <option value="es"  {% if lang == 'es'  %}selected{% endif %}>Español</option>
+      <option value="fr"  {% if lang == 'fr'  %}selected{% endif %}>Français</option>
+      <option value="zh"  {% if lang == 'zh'  %}selected{% endif %}>中文</option>
+      <option value="ar"  {% if lang == 'ar'  %}selected{% endif %}>العربية</option>
+      <option value="hi"  {% if lang == 'hi'  %}selected{% endif %}>हिन्दी</option>
+      <option value="pt"  {% if lang == 'pt'  %}selected{% endif %}>Português</option>
+      <option value="ru"  {% if lang == 'ru'  %}selected{% endif %}>Русский</option>
+      <option value="sw"  {% if lang == 'sw'  %}selected{% endif %}>Kiswahili</option>
+      <option value="tl"  {% if lang == 'tl'  %}selected{% endif %}>Filipino</option>
+      <option value="vi"  {% if lang == 'vi'  %}selected{% endif %}>Tiếng Việt</option>
+      <option value="ko"  {% if lang == 'ko'  %}selected{% endif %}>한국어</option>
+      <option value="so"  {% if lang == 'so'  %}selected{% endif %}>Soomaali</option>
+      <option value="am"  {% if lang == 'am'  %}selected{% endif %}>አማርኛ</option>
+    </select>
+  </form>
+</div>
+
     <h2>Challenge: {{ current_topic.replace('_', ' ') }}</h2>
     <div class="card">
         <form action="/submit" method="POST">
             <label>{{ current_question }}</label>
-            <input type="text" name="answer" autofocus autocomplete="off">
+            <input type="text" name="answer" autofocus autocomplete="off"
+                   dir="auto"
+                   style="width:100%;padding:.75rem;border:1px solid #d4d4d8;
+                          margin-bottom:1rem;box-sizing:border-box;
+                          font-size:1.1rem;">
             <button type="submit" class="btn">Submit Answer</button>
         </form>
         {% if message %} <p style="color: #065f46; background: #ecfdf5; padding: 1rem;">{{ message }}</p> {% endif %}
@@ -854,8 +1074,11 @@ knowledge_model   = DomainKnowledgeModel()
 session_manager   = SessionManager()
 raw_session_store = RawSessionStore()
 llm_client        = LLMClient()
-question_cache    = QuestionCache(llm_client, knowledge_model)
+dispatcher        = OllamaDispatcher()
+question_cache    = QuestionCache(llm_client, knowledge_model, dispatcher=dispatcher)
+contextual_q      = ContextualRequester(question_cache, knowledge_model, dispatcher=dispatcher)
 station_registry  = StationRegistry()
+geometry_manifest = GeometryManifest()
 teacher_auth      = TeacherAuth()
 admin_auth        = AdminAuth()
 
@@ -880,15 +1103,36 @@ def student_dashboard(student_id: str):
     session["student_id"] = student_id
     data = session_manager.get_or_create(student_id)
     topic, domain = data["current_topic"], data["current_domain"]
+    lang = data.get("language", "en")
+    language_name = LANGUAGE_NAMES.get(lang, "English")
   
     if not data.get("current_question"):
-        data["current_question"] = question_cache.get_question(topic, domain)
+        data["current_question"] = question_cache.get_question(topic, domain, lang=lang)
       
     crystals = session_manager.get_crystals(student_id)
-    return render_template_string(
+    rendered = render_template_string(
         STUDENT_TEMPLATE, current_topic=topic, current_question=data["current_question"].question,
-        crystals=crystals, message=request.args.get("message", "")
+        crystals=crystals, message=request.args.get("message", ""), lang=lang
     )
+    return rendered
+
+@app.route("/set_language", methods=["POST"])
+def set_language():
+    student_id = session.get("student_id")
+    if not student_id:
+        return redirect(url_for("index"))
+
+    lang = request.form.get("lang", "en")
+    allowed = {"en","es","fr","zh","ar","hi","pt","ru","sw","tl","vi","ko","so","am"}
+    if lang not in allowed:
+        lang = "en"
+
+    data = session_manager.get_or_create(student_id)
+    data["language"] = lang
+    session_manager.persist_position(student_id, data["position"])
+    data["current_question"] = None
+
+    return redirect(url_for("student_dashboard", student_id=student_id))
 
 @app.route("/submit", methods=["POST"])
 def submit_answer():
@@ -898,9 +1142,10 @@ def submit_answer():
     answer = request.form.get("answer", "").strip().lower()
     data = session_manager.get_or_create(student_id)
     topic, domain = data["current_topic"], data["current_domain"]
-  
-    gq = data.get("current_question") or question_cache.get_question(topic, domain)
-    is_correct = (answer == gq.correct_answer.lower())
+    lang = data.get("language", "en")
+
+    gq = data.get("current_question") or question_cache.get_question(topic, domain, lang=lang)
+    is_correct = _answers_match(answer, gq.correct_answer)
     tracker = data["streak_tracker"]
     streak_before = tracker.current_streak(topic)
 
@@ -931,7 +1176,7 @@ def submit_answer():
         tracker.record_incorrect(topic)
         msg = f"Not quite — the answer is {gq.correct_answer}. Streak reset."
 
-    data["current_question"] = question_cache.get_question(topic, domain)
+    data["current_question"] = contextual_q.get_next(student_id, topic, domain, lang=lang)
     return redirect(url_for("student_dashboard", student_id=student_id, message=msg))
 
 @app.route("/reference/<crystal_id>", methods=["POST"])
@@ -972,7 +1217,7 @@ def station_answer(station_id: str):
     answer = request.form.get("answer", "").strip().lower()
     data = session_manager.get_or_create(student_id)
     gq = _station_questions.get((student_id, station_id), question_cache.get_question(station.topic, station.domain))
-    is_correct = (answer == gq.correct_answer.lower())
+    is_correct = _answers_match(answer, gq.correct_answer)
   
     tracker = data["streak_tracker"]
     raw_session_store.record(RawAnswerEvent(
@@ -1042,6 +1287,62 @@ def admin_dashboard():
 def admin_export_all():
     if not admin_auth.validate_token(session.get("admin_token")): return redirect(url_for("admin_login"))
     return Response(raw_session_store.export_csv(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename=fotnssj_export_{int(time.time())}.csv"})
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "dispatcher": dispatcher.metrics,
+        "geometry": geometry_manifest.summary(),
+    })
+
+ADMIN_GEOMETRY_TEMPLATE = """
+<!DOCTYPE html><html><head><style>body{font-family:system-ui; background:#18181b; color:#e4e4e7; padding:2rem;} .card{background:#27272a; padding:2rem; border-radius:8px; margin-bottom:2rem;} table{width:100%; border-collapse:collapse;} th,td{padding:0.5rem; border-bottom:1px solid #3f3f46; text-align:left;} a{color:#60a5fa;} .critical{color:#ef4444;} .error{color:#f59e0b;} .warning{color:#a3a3a3;}</style></head>
+<body>
+    <h1>Geometry Manifest</h1>
+    <div class="card">
+        <h2>Summary</h2>
+        <p>Unresolved: {{ summary.unresolved }} | Critical: {{ summary.critical_unresolved }} | Errors: {{ summary.error_unresolved }} | Warnings: {{ summary.warning_unresolved }}</p>
+        <p>Affected students: {{ summary.affected_students|length }}</p>
+        <a href="/admin/geometry/export" style="background:#3b82f6; padding:0.5rem; color:white; text-decoration:none; border-radius:4px;">Export JSON</a>
+    </div>
+    <div class="card">
+        <h2>Unresolved Reports</h2>
+        <table><tr><th>ID</th><th>Student</th><th>Type</th><th>Severity</th><th>Detail</th><th>Action</th></tr>
+        {% for r in reports %}
+            <tr>
+                <td>{{ r.report_id }}</td>
+                <td>{{ r.student_id }}</td>
+                <td>{{ r.type_label }}</td>
+                <td class="{{ r.severity }}">{{ r.severity }}</td>
+                <td>{{ r.detail }}</td>
+                <td><form action="/admin/geometry/ack/{{ r.report_id }}" method="POST" style="display:inline;"><button style="background:#10b981;color:white;border:none;padding:0.3rem 0.6rem;border-radius:4px;cursor:pointer;">Ack</button></form></td>
+            </tr>
+        {% endfor %}
+        </table>
+    </div>
+</body></html>
+"""
+
+@app.route("/admin/geometry")
+def admin_geometry():
+    if not admin_auth.validate_token(session.get("admin_token")): return redirect(url_for("admin_login"))
+    return render_template_string(
+        ADMIN_GEOMETRY_TEMPLATE,
+        summary=geometry_manifest.summary(),
+        reports=geometry_manifest.unresolved(),
+    )
+
+@app.route("/admin/geometry/export")
+def admin_geometry_export():
+    if not admin_auth.validate_token(session.get("admin_token")): return redirect(url_for("admin_login"))
+    return jsonify(geometry_manifest.all_reports())
+
+@app.route("/admin/geometry/ack/<report_id>", methods=["POST"])
+def admin_geometry_ack(report_id: str):
+    if not admin_auth.validate_token(session.get("admin_token")): return redirect(url_for("admin_login"))
+    geometry_manifest.acknowledge(report_id, "admin")
+    return redirect(url_for("admin_geometry"))
 
 
 # ════════════════════════════════════════════════════════════════════════

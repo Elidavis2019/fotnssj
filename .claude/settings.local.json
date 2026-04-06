@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import fotnssj\")",
+      "Bash(timeout 10 python -c ':*)",
+      "Bash(echo \"EXIT: $?\")"
+    ]
+  }
+}
