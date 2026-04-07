@@ -1,5 +1,3 @@
-docker-compose.prod.yml
-
 # ════════════════════════════════════════════════════════════════════════
 # FOTNSSJ Production Compose
 # Adds nginx TLS termination, Prometheus, and automatic backups.

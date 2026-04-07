@@ -4,11 +4,11 @@ from typing import Dict, Tuple
 
 @dataclass
 class ManifoldBounds:
-    alpha_min: float = 0.0
+    alpha_min: float = 0.01
     alpha_max: float = 10.0
-    cave_min: float = 0.0
+    cave_min: float = 0.01
     cave_max: float = 10.0
-    l_net_min: float = 0.0
+    l_net_min: float = 0.01
     l_net_max: float = 10.0
     max_delta: float = 2.0
     max_teleport: float = 5.0

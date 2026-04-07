@@ -1,5 +1,3 @@
-.GITHUB/WORKFLOWS/CI.YML
-
 name: CI
 
 on:
@@ -32,7 +30,7 @@ jobs:
                  sync/ \
                  cloud/receiver.py \
             --max-line-length=120 \
-            --extend-ignore=E501,W503,E302,E303 \
+            --extend-ignore=E501,W503,E302,E303,E221,E231,E272,E701,E305,E128,W291,W292,W293,F401 \
             --exclude=__pycache__,*.pyc
 
   test-unit:

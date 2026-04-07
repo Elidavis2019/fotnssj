@@ -1,5 +1,3 @@
-tests/test_sync.py
-
 """
 Tests for DifferentialRenderer — no network needed.
 """

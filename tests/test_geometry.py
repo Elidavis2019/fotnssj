@@ -1,5 +1,3 @@
-tests/test_geometry.py
-
 import math
 import sys
 import os

@@ -1,5 +1,3 @@
-cloud/receiver.py
-
 # ════════════════════════════════════════════════════════════════════════
 # FOTNSSJ Cloud Trajectory Receiver
 #

@@ -1,5 +1,3 @@
-docker-compose.cloud.yml
-
 # Deploy the cloud receiver separately from the school node.
 # Usage:
 #   docker-compose -f docker-compose.cloud.yml up -d

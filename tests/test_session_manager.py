@@ -1,5 +1,3 @@
-tests/test_session_manager.py
-
 """
 Tests for persistent SessionManager.
 """

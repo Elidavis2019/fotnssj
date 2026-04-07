@@ -1,5 +1,3 @@
-tests/test_dispatch.py
-
 """
 Tests for OllamaDispatcher — mocks the HTTP call so no Ollama needed.
 """

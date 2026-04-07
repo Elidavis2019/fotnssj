@@ -3,7 +3,12 @@
     "allow": [
       "Bash(python -c \"import fotnssj\")",
       "Bash(timeout 10 python -c ':*)",
-      "Bash(echo \"EXIT: $?\")"
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('geometry/tilt.py', doraise=True\\); py_compile.compile\\('geometry/bounds.py', doraise=True\\); py_compile.compile\\('geometry/manifest.py', doraise=True\\); py_compile.compile\\('geometry/progression.py', doraise=True\\); print\\('geometry/ OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('branches/agent.py', doraise=True\\); py_compile.compile\\('branches/system.py', doraise=True\\); print\\('branches/ OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('dispatch/ollama.py', doraise=True\\); py_compile.compile\\('sync/differential.py', doraise=True\\); py_compile.compile\\('cloud/receiver.py', doraise=True\\); print\\('dispatch/sync/cloud OK'\\)\")",
+      "Bash(python -c 'import py_compile; py_compile.compile\\('\\\\''__TRACKED_VAR__'\\\\'', doraise=True\\)')",
+      "Bash(python -c \"from geometry.tilt import calculate_syncletic_tilt, _bessel_j0; print\\('j0\\(0\\):', _bessel_j0\\(0.0\\)\\); r = calculate_syncletic_tilt\\(1.0, 5.0, 2, True\\); print\\('tilt:', r\\)\")"
     ]
   }
 }

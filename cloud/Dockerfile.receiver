@@ -1,5 +1,3 @@
-cloud/Dockerfile.receiver
-
 FROM python:3.11-slim
 
 RUN groupadd -r receiver && useradd -r -g receiver -d /app -s /sbin/nologin receiver

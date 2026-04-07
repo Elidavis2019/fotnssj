@@ -260,8 +260,9 @@ class RawAnswerEvent:
 class RawSessionStore:
     SESSIONS_ROOT = Path("/data/sessions")
 
-    def __init__(self, sessions_root: Optional[Path] = None):
+    def __init__(self, sessions_root: Optional[Path] = None, root: Optional[Path] = None):
         if sessions_root: self.SESSIONS_ROOT = sessions_root
+        if root: self.SESSIONS_ROOT = root
         self.SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
@@ -844,8 +845,9 @@ class Station:
 class StationRegistry:
     STORAGE_PATH = Path("/data/stations/stations.json")
 
-    def __init__(self, storage_path: Optional[Path] = None):
+    def __init__(self, storage_path: Optional[Path] = None, path: Optional[Path] = None):
         if storage_path: self.STORAGE_PATH = storage_path
+        if path: self.STORAGE_PATH = path
         self.STORAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
         self._stations: Dict[str, Station] = {}
         self._lock = threading.Lock()
@@ -922,11 +924,14 @@ class TeacherAuth:
         return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), self.ITERATIONS).hex()
 
     def _save(self): self.AUTH_PATH.write_text(json.dumps(self._accounts))
-    def _load(self): 
+
+    def _load(self):
         if self.AUTH_PATH.exists(): self._accounts = json.loads(self.AUTH_PATH.read_text())
+
 
 class AdminAuth:
     AUTH_PATH = Path("/data/auth/admin.json")
+
     def __init__(self):
         self.AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
         self._account, self._session = None, None
@@ -951,7 +956,8 @@ class AdminAuth:
         return bool(self._session and self._session["token"] == token and time.time() < self._session["expires"])
 
     def _save(self): self.AUTH_PATH.write_text(json.dumps(self._account or {}))
-    def _load(self): 
+
+    def _load(self):
         if self.AUTH_PATH.exists(): self._account = json.loads(self.AUTH_PATH.read_text())
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1016,7 +1022,7 @@ STUDENT_TEMPLATE = """
 ADMIN_DASHBOARD_TEMPLATE = """
 <!DOCTYPE html><html><head><style>body{font-family:system-ui; background:#18181b; color:#e4e4e7; padding:2rem;} .card{background:#27272a; padding:2rem; border-radius:8px; margin-bottom:2rem;} table{width:100%; border-collapse:collapse;} th,td{padding:0.5rem; border-bottom:1px solid #3f3f46; text-align:left;} a{color:#60a5fa;}</style></head>
 <body>
-    <h1>Admin Portal</h1>
+    <h1>FOTNSSJ Admin</h1>
     <div class="card">
         <h2>School Overview</h2>
         <p>Students: {{ total_students }} | Accuracy: {{ school_accuracy }}% | Total Checkpoints: {{ total_checkpoints }}</p>
@@ -1104,8 +1110,7 @@ def student_dashboard(student_id: str):
     data = session_manager.get_or_create(student_id)
     topic, domain = data["current_topic"], data["current_domain"]
     lang = data.get("language", "en")
-    language_name = LANGUAGE_NAMES.get(lang, "English")
-  
+
     if not data.get("current_question"):
         data["current_question"] = question_cache.get_question(topic, domain, lang=lang)
       
@@ -1195,6 +1200,17 @@ def reference_crystal(crystal_id: str):
 
 # --- NFC STATION ROUTES ---
 _station_questions = {}
+_station_qs = _station_questions  # alias for tests
+
+
+def _get_station_q(key, fallback):
+    """Retrieve question from station cache, handling (gq, timestamp) tuples."""
+    val = _station_questions.get(key)
+    if val is None:
+        return fallback
+    if isinstance(val, tuple):
+        return val[0]
+    return val
 
 @app.route("/station/<station_id>")
 def station_view(station_id: str):
@@ -1204,8 +1220,11 @@ def station_view(station_id: str):
     if not station or not station.active: return "Station not found.", 404
   
     station_registry.increment_scan(station_id)
-    gq = _station_questions.setdefault((student_id, station_id), question_cache.get_question(station.topic, station.domain))
-  
+    fallback = question_cache.get_question(station.topic, station.domain)
+    gq = _get_station_q((student_id, station_id), fallback)
+    if (student_id, station_id) not in _station_questions:
+        _station_questions[(student_id, station_id)] = gq
+
     return render_template_string(STATION_TEMPLATE, station=station, question=gq, message=request.args.get("message", ""))
 
 @app.route("/station/<station_id>/answer", methods=["POST"])
@@ -1216,9 +1235,9 @@ def station_answer(station_id: str):
   
     answer = request.form.get("answer", "").strip().lower()
     data = session_manager.get_or_create(student_id)
-    gq = _station_questions.get((student_id, station_id), question_cache.get_question(station.topic, station.domain))
+    gq = _get_station_q((student_id, station_id), question_cache.get_question(station.topic, station.domain))
     is_correct = _answers_match(answer, gq.correct_answer)
-  
+
     tracker = data["streak_tracker"]
     raw_session_store.record(RawAnswerEvent(
         id=str(uuid.uuid4()), student_id=student_id, topic=station.topic, domain=station.domain,
@@ -1252,7 +1271,7 @@ def station_reference(station_id: str):
     same_topic = [c for c in crystals if c.topic == station.topic]
     reference = max(same_topic or crystals, key=lambda c: c.saved_at) if crystals else None
   
-    gq = _station_questions.get((student_id, station_id), question_cache.get_question(station.topic, station.domain))
+    gq = _get_station_q((student_id, station_id), question_cache.get_question(station.topic, station.domain))
     return render_template_string(STATION_TEMPLATE, station=station, question=gq, reference=reference)
 
 # --- ADMIN ROUTES ---

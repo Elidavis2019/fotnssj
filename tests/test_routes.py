@@ -1,5 +1,3 @@
-tests/test_routes.py
-
 """
 Flask route integration tests — no Ollama needed.
 Dispatcher callbacks are stubbed.
