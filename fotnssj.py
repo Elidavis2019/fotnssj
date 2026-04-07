@@ -44,19 +44,29 @@ from geometry.manifest import GeometryManifest
 
 def _parse_questions(raw: str) -> Optional[List[Dict]]:
     """Parse a JSON array of question dicts from raw LLM output."""
-    start, end = raw.find("["), raw.rfind("]")
-    if start == -1 or end == -1:
+    start = raw.find("[")
+    if start == -1:
         return None
-    try:
-        data = json.loads(raw[start:end + 1])
-        valid = [
-            i for i in data
-            if isinstance(i, dict)
-            and {"question", "correct_answer", "explanation", "bridge"}.issubset(i.keys())
-        ]
-        return valid if valid else None
-    except json.JSONDecodeError:
-        return None
+    # Try each ']' from the first one forward until valid JSON parses
+    pos = start
+    while True:
+        end = raw.find("]", pos + 1)
+        if end == -1:
+            return None
+        try:
+            data = json.loads(raw[start:end + 1])
+            if not isinstance(data, list):
+                pos = end
+                continue
+            valid = [
+                i for i in data
+                if isinstance(i, dict)
+                and {"question", "correct_answer", "explanation", "bridge"}.issubset(i.keys())
+            ]
+            return valid if valid else None
+        except json.JSONDecodeError:
+            pos = end
+            continue
 
 def _answers_match(student_answer: str, correct_answer: str) -> bool:
     """
@@ -349,30 +359,26 @@ LANGUAGE_NAMES = {
     "am": "Amharic",
 }
 
+_PROMPT_SUFFIX = (
+    'Write ALL content in {language}. '
+    'Respond with ONLY a JSON array of objects, no other text. '
+    'Each object MUST have these exact keys: '
+    '"question", "correct_answer", "explanation", "bridge". '
+    'Example: [{{"question":"What is 3+5?","correct_answer":"8",'
+    '"explanation":"3 plus 5 equals 8","bridge":"Addition combines two numbers"}}]'
+)
 PROMPTS = {
     "arithmetic": (
         "Generate exactly {n} math questions for topic: {topic}. "
-        "Principle: {principle}. Difficulty: {d}/3. "
-        "Write ALL questions, answers, explanations, and bridges "
-        "in {language}. "
-        "Respond ONLY with a JSON array. Keys per item: "
-        "question, correct_answer, explanation, bridge, difficulty."
+        "Principle: {principle}. Difficulty: {d}/3. " + _PROMPT_SUFFIX
     ),
     "reading": (
         "Generate exactly {n} reading/phonics questions for topic: {topic}. "
-        "Principle: {principle}. Difficulty: {d}/3. "
-        "Write ALL questions, answers, explanations, and bridges "
-        "in {language}. "
-        "Respond ONLY with a JSON array. Keys per item: "
-        "question, correct_answer, explanation, bridge, difficulty."
+        "Principle: {principle}. Difficulty: {d}/3. " + _PROMPT_SUFFIX
     ),
     "default": (
         "Generate exactly {n} educational questions for topic: {topic}. "
-        "Principle: {principle}. Difficulty: {d}/3. "
-        "Write ALL questions, answers, explanations, and bridges "
-        "in {language}. "
-        "Respond ONLY with a JSON array. Keys per item: "
-        "question, correct_answer, explanation, bridge, difficulty."
+        "Principle: {principle}. Difficulty: {d}/3. " + _PROMPT_SUFFIX
     ),
 }
 
@@ -507,7 +513,7 @@ class QuestionCache:
             self._dispatcher.submit(
                 student_id=f"__cache_{topic}_{lang}",
                 prompt=prompt, callback=on_result,
-                priority=priority, timeout=20.0,
+                priority=priority, timeout=90.0,
             )
         else:
             # Fallback: use LLMClient in a background thread
@@ -596,7 +602,7 @@ class ContextualRequester:
         self._dispatcher.submit(
             student_id=student_id,
             prompt=prompt, callback=on_result,
-            priority=Priority.HIGH, timeout=15.0,
+            priority=Priority.HIGH, timeout=90.0,
         )
 
 # ════════════════════════════════════════════════════════════════════════
@@ -647,7 +653,7 @@ class SessionManager:
             self.STATE_ROOT = state_root
         self.STATE_ROOT.mkdir(parents=True, exist_ok=True)
         self._students: Dict[str, Dict] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def get_or_create(self, student_id: str) -> Dict:
         with self._lock:

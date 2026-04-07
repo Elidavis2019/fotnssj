@@ -32,7 +32,7 @@ class OllamaDispatcher:
     MAX_DEPTH = 60
 
     def __init__(self, base_url: str = "http://localhost:11434",
-                 model: str = "qwen3:1.5b", num_ctx: int = 2048):
+                 model: str = "aikid123/qwen3-1.5b-turbo", num_ctx: int = 2048):
         self.model     = model
         self.num_ctx   = num_ctx
         self._endpoint = f"{base_url.rstrip('/')}/api/generate"
@@ -114,7 +114,8 @@ class OllamaDispatcher:
             "prompt":  req.prompt,
             "stream":  False,
             "options": {"num_ctx": self.num_ctx, "temperature": 0.7,
-                        "num_predict": 512, "stop": ["```"]},
+                        "num_predict": 1024},
+            "think": False,
         }).encode()
         try:
             remaining = max(1.0, req.timeout - (time.time() - req.enqueued_at))
